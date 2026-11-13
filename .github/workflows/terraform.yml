@@ -1,0 +1,102 @@
+name: terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build aws-emulator image
+        run: docker build -t aws-emulator .
+
+      # Mirror the local setup: the emulator writes its config, credentials and
+      # CA into $HOME/.aws/emulator/9297, so mount that path at the same
+      # location and run as the runner user so the files are readable here.
+      - name: Start aws-emulator
+        run: |
+          mkdir -p "$HOME/.aws/emulator"
+          docker run -d --name aws-emulator \
+            --user "$(id -u):$(id -g)" \
+            -e HOME="$HOME" \
+            -e EMULATOR_TELEMETRY=off \
+            -v "$HOME/.aws/emulator:$HOME/.aws/emulator" \
+            -p 127.0.0.1:9297:9297 \
+            aws-emulator
+
+          dir="$HOME/.aws/emulator/9297"
+          for _ in $(seq 1 60); do
+            if [ -f "$dir/ca.pem" ] && curl -sf --cacert "$dir/ca.pem" https://127.0.0.1:9297/__admin/health; then
+              echo " -> emulator is healthy"
+              break
+            fi
+            sleep 1
+          done
+          curl -sf --cacert "$dir/ca.pem" https://127.0.0.1:9297/__admin/health >/dev/null
+
+          {
+            echo "AWS_ENDPOINT_URL=https://127.0.0.1:9297"
+            echo "AWS_SHARED_CREDENTIALS_FILE=$dir/emulator_credentials"
+            echo "AWS_CONFIG_FILE=$dir/config"
+            echo "AWS_CA_BUNDLE=$dir/ca.pem"
+            echo "AWS_EC2_METADATA_DISABLED=true"
+            echo "AWS_DISABLE_HOST_PREFIX_INJECTION=true"
+            echo "AWS_REGION=us-east-1"
+            echo "AWS_DEFAULT_REGION=us-east-1"
+          } >> "$GITHUB_ENV"
+
+      - name: Read Terraform version
+        id: tfversion
+        run: echo "version=$(cat .terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.tfversion.outputs.version }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        run: |
+          terraform plan -out=tfplan
+          {
+            echo '### terraform plan'
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: terraform apply
+        run: terraform apply tfplan
+
+      # A second plan after apply must be empty; exit code 2 means drift.
+      - name: terraform plan (idempotency check)
+        run: terraform plan -detailed-exitcode
+
+      - name: Show emulator logs
+        if: failure()
+        run: docker logs aws-emulator
